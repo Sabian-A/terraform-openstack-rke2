@@ -84,8 +84,33 @@ write_files:
     export INSTALL_RKE2_VERSION=${rke2_version}
     which rke2 >/dev/null 2>&1 && RKE2_VERSION=$(rke2 --version | head -1 | cut -f 3 -d " ")
     if ([ -z "$RKE2_VERSION" ]) || ([ -n "$INSTALL_RKE2_VERSION" ] && [ "$INSTALL_RKE2_VERSION" != "$RKE2_VERSION" ]); then
-      curl -sfL https://get.rke2.io | sh - || { echo "Failed to download or install rke2"; exit 1; }
+      curl -sfL https://get.rke2.io -o /tmp/rke2-install.sh && sh /tmp/rke2-install.sh || { echo "Failed to download or install rke2"; exit 1; }
     fi
+- path: /usr/local/bin/cloud-init-wait.sh
+  permissions: "0755"
+  owner: root:root
+  content: |
+    #!/bin/bash
+    wait_for() {
+      _wf_desc="$1"; _wf_test="$2"; _wf_sleep="$3"; _wf_max="$4"; _wf_n=0
+      until eval "$_wf_test"; do
+        _wf_n=$((_wf_n + 1))
+        if [ "$_wf_n" -ge "$_wf_max" ]; then
+          echo "FATAL: $_wf_desc not ready after $_wf_max attempts on $(hostname) - node unusable, aborting cloud-init"
+          exit 1
+        fi
+        echo "Waiting for $(hostname): $_wf_desc ($_wf_n/$_wf_max)"
+        sleep "$_wf_sleep"
+      done
+    }
+    _charts_ready() {
+      _cr_miss=""
+      for _cr_p in /opt/rke2/manifests/patches/*; do
+        [ -e "$_cr_p" ] || continue
+        [ -f "/var/lib/rancher/rke2/server/manifests/$(basename "$_cr_p")" ] || _cr_miss=1
+      done
+      [ -z "$_cr_miss" ]
+    }
 %{ if is_server ~}
   %{~ for k, v in manifests_files ~}
 - path: /opt/rke2/manifests/${k}
@@ -97,37 +122,13 @@ write_files:
 - path: /usr/local/bin/customize-chart.sh
   permissions: "0755"
   owner: root:root
-  content: |
-    #!/bin/bash
-    CHART_FILE=$1
-    CHART_NAME=$(basename $CHART_FILE .yaml)
-    DELTA=$2
-    TAR_FILE=chart.tar
-    FILE=values.yaml
-    TAR_OPTS="--owner=0 --group=0 --mode=gou-s+r --numeric-owner --no-acls --no-selinux --no-xattrs"
-    echo "Customizing $CHART_FILE with $DELTA"
-    cat $CHART_FILE | yq -r .spec.chartContent | base64 -d | gunzip - > $TAR_FILE
-    tar -xOf $TAR_FILE $CHART_NAME/$FILE > $FILE
-    yq -i e '. *= load("'$DELTA'")' $FILE
-    tar --delete -b 8192 -f $TAR_FILE $CHART_NAME/$FILE
-    tar --transform="s|.*|$CHART_NAME/$FILE|" $TAR_OPTS -vrf $TAR_FILE $FILE
-    gzip -9 $TAR_FILE
-    cat $TAR_FILE.gz | base64 -w 0 > $TAR_FILE.gz.b64
-    yq -i e '.spec.chartContent = load_str("'$TAR_FILE'.gz.b64")' $CHART_FILE
-    rm $TAR_FILE.gz $TAR_FILE.gz.b64 $FILE
+  encoding: gz+b64
+  content: ${customize_chart_script}
 - path: /usr/local/bin/customize-charts.sh
   permissions: "0755"
   owner: root:root
-  content: |
-    #!/bin/bash
-    CHARTS_DIR=$1
-    ls $CHARTS_DIR
-    for patch in /opt/rke2/manifests/patches/*; do
-      patch_name=$(basename "$patch")
-      if [ -f "$CHARTS_DIR/$patch_name" ] && [ "$(yq e 'length' "$CHARTS_DIR/$patch_name")" -ne "0" ]; then
-        /usr/local/bin/customize-chart.sh "$CHARTS_DIR/$patch_name" "$patch"
-      fi
-    done
+  encoding: gz+b64
+  content: ${customize_charts_script}
 - path: /etc/modules-load.d/ipvs.conf
   permissions: "0644"
   owner: root:root
@@ -239,10 +240,10 @@ write_files:
     etcd-s3-region: "${s3.region}"
     %{~ endif ~}
       %{~ if backup_schedule != null ~}
-    etcd-snapshot-schedule-cron: ${backup_schedule}
+    etcd-snapshot-schedule-cron: "${backup_schedule}"
       %{~ endif ~}
       %{~ if backup_retention != null ~}
-    etcd-snapshot-retention: ${backup_retention}
+    etcd-snapshot-retention: "${backup_retention}"
       %{~ endif ~}
     etcd-snapshot-compress: true
     %{~ endif ~}
@@ -278,7 +279,7 @@ write_files:
   content: |
     token: "${rke2_token}"
     server: https://${internal_vip}:9345
-    node-ip: ${node_ip}
+    node-ip: "${node_ip}"
     cloud-provider-name: external
     %{~ if length(node_taints) > 0 ~}
     node-taint:
@@ -310,44 +311,42 @@ runcmd:
   - systemctl enable mnt.mount var-lib-rancher-rke2.mount var-lib-kubelet.mount
   - systemctl start mnt.mount var-lib-rancher-rke2.mount var-lib-kubelet.mount
   %{~ for key in authorized_keys ~}
-  - echo "${key}" >> /home/${system_user}/.ssh/authorized_keys
+  - grep -qxF "${key}" /home/${system_user}/.ssh/authorized_keys || echo "${key}" >> /home/${system_user}/.ssh/authorized_keys
   %{~ endfor ~}
   - /usr/local/bin/install-or-upgrade-rke2.sh
-  - echo 'alias crictl="sudo /var/lib/rancher/rke2/bin/crictl -r unix:///run/k3s/containerd/containerd.sock"' >> /home/${system_user}/.bashrc
-  - echo 'alias ctr="sudo /var/lib/rancher/rke2/bin/ctr --address /run/k3s/containerd/containerd.sock --namespace k8s.io"' >> /home/${system_user}/.bashrc
-  - >
-    for MNT in /mnt; do
-      RETRIES=0; MAX_RETRIES=30;
-      until mountpoint -q "$MNT"; do
-        RETRIES=$((RETRIES + 1));
-        if [ $RETRIES -ge $MAX_RETRIES ]; then
-          echo "ERROR: $MNT not mounted after $MAX_RETRIES retries.";
-          exit 1;
-        fi;
-        echo "$MNT not mounted yet, retrying in 10 seconds...";
-        sleep 5;
-      done;
-      echo "$MNT mounted successfully.";
-    done;
+  - systemctl daemon-reload
+  - grep -qxF 'alias crictl="sudo /var/lib/rancher/rke2/bin/crictl -r unix:///run/k3s/containerd/containerd.sock"' /home/${system_user}/.bashrc || echo 'alias crictl="sudo /var/lib/rancher/rke2/bin/crictl -r unix:///run/k3s/containerd/containerd.sock"' >> /home/${system_user}/.bashrc
+  - grep -qxF 'alias ctr="sudo /var/lib/rancher/rke2/bin/ctr --address /run/k3s/containerd/containerd.sock --namespace k8s.io"' /home/${system_user}/.bashrc || echo 'alias ctr="sudo /var/lib/rancher/rke2/bin/ctr --address /run/k3s/containerd/containerd.sock --namespace k8s.io"' >> /home/${system_user}/.bashrc
+  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "/mnt mountpoint" "mountpoint -q /mnt" 5 30'
   %{~ if is_server ~}
   - systemctl restart systemd-modules-load.service # ensure ipvs is loaded
-  - echo 'alias kubectl="sudo /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml"' >> /home/${system_user}/.bashrc
-  - rm -rf /var/lib/rancher/rke2/server/manifests # single-node cleanup
+  - grep -qxF 'alias kubectl="sudo /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml"' /home/${system_user}/.bashrc || echo 'alias kubectl="sudo /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml"' >> /home/${system_user}/.bashrc
+  - if ! systemctl is-active -q rke2-server.service; then rm -rf /var/lib/rancher/rke2/server/manifests; fi # clear stale manifests only on a fresh/inactive node
+  - >
+    YQ_SHA256="bccbf5ce1717ea5cec9662446b8bfa5863747ffb0a49a32e4c8dd23ada5c26fa";
+    for i in $(seq 1 10); do
+      wget -T 30 https://github.com/mikefarah/yq/releases/download/v4.40.5/yq_linux_amd64.tar.gz -O /tmp/yq_linux_amd64.tar.gz && echo "$YQ_SHA256  /tmp/yq_linux_amd64.tar.gz" | sha256sum -c - && tar xzf /tmp/yq_linux_amd64.tar.gz -C /tmp && mv /tmp/yq_linux_amd64 /usr/bin/yq && break;
+      sleep 5;
+    done;
+    rm -f /tmp/yq_linux_amd64.tar.gz;
+    command -v yq >/dev/null || { echo "ERROR: yq install/checksum failed"; exit 1; };
   - systemctl enable rke2-server.service
   - systemctl start rke2-server.service
-  - until [ -d /var/lib/rancher/rke2/agent/pod-manifests/ ]; do echo "Waiting for $(hostname) static pods"; sleep 1; done
+  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "chart manifests" _charts_ready 1 60'
+  - /usr/local/bin/customize-charts.sh /var/lib/rancher/rke2/server/manifests
+  - >
+    for f in /opt/rke2/manifests/*.yaml; do [ -e "$f" ] || continue; mv -v "$f" /var/lib/rancher/rke2/server/manifests; done;
+  - ls /var/lib/rancher/rke2/server/manifests
+  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "static pod manifests dir" "[ -d /var/lib/rancher/rke2/agent/pod-manifests/ ]" 1 60'
   - mv -v /opt/rke2/kube-vip.yaml /var/lib/rancher/rke2/agent/pod-manifests/kube-vip.yaml
   - ls /var/lib/rancher/rke2/agent/pod-manifests
-  - wget https://github.com/mikefarah/yq/releases/download/v4.40.5/yq_linux_amd64.tar.gz -O - | tar xz && mv yq_linux_amd64 /usr/bin/yq
-  - until [ -d /var/lib/rancher/rke2/data/v*/charts ]; do echo "Waiting for $(hostname) charts data"; sleep 1; done
-  - /usr/local/bin/customize-charts.sh $(realpath /var/lib/rancher/rke2/data/v*/charts)
-  - until [ -d /var/lib/rancher/rke2/server/manifests ]; do echo "Waiting for $(hostname) manifests"; sleep 1; done
-  - /usr/local/bin/customize-charts.sh /var/lib/rancher/rke2/server/manifests
-  - mv -v /opt/rke2/manifests/*.yaml /var/lib/rancher/rke2/server/manifests
-  - ls /var/lib/rancher/rke2/server/manifests
-  - until systemctl is-active -q rke2-server.service; do echo "Waiting for $(hostname) rke2 to start"; sleep 3; journalctl -u rke2-server.service --since "3 second ago"; done
+  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "rke2-server active" "systemctl is-active -q rke2-server.service" 3 60'
+  %{~ if bootstrap ~}
+  - systemctl restart rke2-server.service # force deploy controller to re-read patched server/manifests (bootstrap only)
+  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "rke2-server active after restart" "systemctl is-active -q rke2-server.service" 3 60'
+  %{~ endif ~}
   %{~ else ~}
   - systemctl enable rke2-agent.service
   - systemctl start rke2-agent.service
-  - until systemctl is-active -q rke2-agent.service; do echo "Waiting for $(hostname) rke2 to start"; sleep 3; journalctl -u rke2-agent.service --since "3 second ago"; done
+  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "rke2-agent active" "systemctl is-active -q rke2-agent.service" 3 60'
   %{~ endif ~}

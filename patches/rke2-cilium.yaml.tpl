@@ -2,7 +2,7 @@ cluster:
   name: ${cluster_name}
   id: ${cluster_id}
 enableIPv4Masquerade: true
-kubeProxyReplacement: "${ff_with_kubeproxy ? false : true}"
+kubeProxyReplacement: ${ff_with_kubeproxy ? "false" : "true"}
 k8sServiceHost: 127.0.0.1
 k8sServicePort: 6443
 operator:
