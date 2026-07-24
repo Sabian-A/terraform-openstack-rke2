@@ -151,3 +151,8 @@ def merge_patch(values_path: Path, patch_path: Path, output_path: Path) -> None:
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def normalize_unified_diff(text: str) -> str:
+    """Normalize blank unified-diff context lines."""
+    return "".join(" \n" if line == "\n" else line for line in text.splitlines(keepends=True))

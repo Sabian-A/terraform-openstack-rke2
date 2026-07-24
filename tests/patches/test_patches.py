@@ -10,6 +10,7 @@ from helpers import (
     SNAPSHOTS_DIR,
     extract_chart_values,
     merge_patch,
+    normalize_unified_diff,
     patch_top_level_keys,
     run,
     sha256_file,
@@ -63,11 +64,12 @@ def test_patches(version, rendered_patches, charts_cache):
             assert snapshot_file.is_file(), (
                 f"Missing snapshot {snapshot_file}; run UPDATE_SNAPSHOTS=1 pytest tests/patches"
             )
-            expected = snapshot_file.read_text()
-            if diff_content != expected:
+            expected = normalize_unified_diff(snapshot_file.read_text())
+            actual = normalize_unified_diff(diff_content)
+            if actual != expected:
                 delta = unified_diff(
                     expected.splitlines(keepends=True),
-                    diff_content.splitlines(keepends=True),
+                    actual.splitlines(keepends=True),
                     fromfile=str(snapshot_file),
                     tofile=f"{chart}@{version}",
                 )

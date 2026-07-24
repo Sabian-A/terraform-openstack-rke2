@@ -55,7 +55,7 @@
    #     memory: 1Gi
 @@ -272,7 +278,7 @@
    #  - portmap
-
+ 
    # Otherwise rke2 hostPort does not work! Used for nginx
 -  chainingMode: portmap
 +  chainingMode: "none"
