@@ -14,7 +14,9 @@ fs_setup:
 
 package_update: true
 package_upgrade: true
-package_reboot_if_required: true
+# When we install the NVIDIA driver ourselves we reboot explicitly after modules
+# fail to load; avoid an earlier cloud-init reboot racing that path.
+package_reboot_if_required: ${gpu.enabled && !gpu.driver.preinstalled ? false : true}
 packages:
   - fail2ban
   - unattended-upgrades
@@ -26,12 +28,34 @@ packages:
   - logrotate
   - nfs-client
   - fio
+%{ if gpu.enabled && !gpu.driver.preinstalled }
+  - ${gpu.driver.package}
+%{ endif }
+%{ if gpu.enabled }
+  - ${gpu.toolkit_package}
+%{ endif }
 
 users:
   - default
 
 ntp:
   enabled: true
+
+%{ if gpu.enabled ~}
+# Add NVIDIA container toolkit apt repo before package installs (bootcmd runs early).
+bootcmd:
+  - |
+    set -e
+    KEYRING=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    LIST=/etc/apt/sources.list.d/nvidia-container-toolkit.list
+    if [ ! -f "$LIST" ]; then
+      mkdir -p /usr/share/keyrings
+      fetch() { curl -fsSL "$1" 2>/dev/null || wget -qO- "$1"; }
+      fetch https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o "$KEYRING"
+      fetch https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+        | sed "s#deb https://#deb [signed-by=$KEYRING] https://#g" > "$LIST"
+    fi
+%{ endif ~}
 
 write_files:
 - path: /etc/logrotate.conf
@@ -304,6 +328,110 @@ write_files:
   content: |
     ${ indent(4, yamlencode(registries)) }
 %{~ endif ~}
+%{~ if gpu.enabled ~}
+- path: /usr/local/bin/setup-gpu.sh
+  permissions: "0755"
+  owner: root:root
+  content: |
+    #!/bin/bash
+    set -euo pipefail
+
+    if [ -f /var/lib/gpu-setup-done ]; then
+      echo "GPU setup already completed, skipping..."
+      exit 0
+    fi
+
+    echo "=== Setting up NVIDIA GPU runtime ==="
+
+    echo "Loading NVIDIA kernel modules..."
+    # After a driver install + reboot, modules can take a moment to become available.
+    NVIDIA_MODPROBE_OK=0
+    for i in $(seq 1 30); do
+      if modprobe nvidia; then
+        NVIDIA_MODPROBE_OK=1
+        break
+      fi
+      echo "Waiting for nvidia module ($i/30)..."
+      sleep 2
+    done
+    if [ "$NVIDIA_MODPROBE_OK" -ne 1 ]; then
+      echo "ERROR: failed to load nvidia kernel module"
+      exit 1
+    fi
+    modprobe nvidia_uvm || true
+
+    echo "Locating nvidia-container-runtime..."
+    if ! command -v nvidia-container-runtime >/dev/null 2>&1; then
+      echo "ERROR: nvidia-container-runtime not found; is ${gpu.toolkit_package} installed?"
+      exit 1
+    fi
+    RUNTIME_BIN="$(command -v nvidia-container-runtime)"
+    NVIDIA_BIN_DIR="$(dirname "$RUNTIME_BIN")"
+    test -x "$RUNTIME_BIN"
+
+    # nvidia-container-runtime must be on the rke2-agent service PATH; systemd does
+    # not expand $PATH, so set an absolute PATH that includes the toolkit.
+    echo "Configuring rke2-agent PATH..."
+    mkdir -p /etc/default
+    DEFAULT_PATH="$NVIDIA_BIN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [ -f /etc/default/rke2-agent ] && grep -qs "^PATH=" /etc/default/rke2-agent; then
+      # Ensure toolkit dir is first on PATH without duplicating entries.
+      sed -i "s|^PATH=.*|PATH=$DEFAULT_PATH|" /etc/default/rke2-agent
+    else
+      echo "PATH=$DEFAULT_PATH" >> /etc/default/rke2-agent
+    fi
+
+    # RKE2 regenerates containerd's config.toml on start; the nvidia runtime must
+    # be registered via a template extending the base:
+    # - config.toml.tmpl for containerd 1.x (RKE2 < v1.31.6)
+    # - config-v3.toml.tmpl for containerd 2.0+ (RKE2 >= v1.31.6)
+    echo "Writing containerd templates..."
+    mkdir -p /var/lib/rancher/rke2/agent/etc/containerd
+    printf '%s\n' \
+      '{{ template "base" . }}' \
+      '' \
+      '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]' \
+      '  runtime_type = "io.containerd.runc.v2"' \
+      '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]' \
+      '  BinaryName = "'"$RUNTIME_BIN"'"' \
+      '  SystemdCgroup = true' \
+      > /var/lib/rancher/rke2/agent/etc/containerd/config.toml.tmpl
+    printf '%s\n' \
+      '{{ template "base" . }}' \
+      '' \
+      '[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.nvidia]' \
+      '  runtime_type = "io.containerd.runc.v2"' \
+      '[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.nvidia.options]' \
+      '  BinaryName = "'"$RUNTIME_BIN"'"' \
+      '  SystemdCgroup = true' \
+      > /var/lib/rancher/rke2/agent/etc/containerd/config-v3.toml.tmpl
+
+    touch /var/lib/gpu-setup-done
+    echo "=== GPU setup complete ==="
+
+- path: /etc/systemd/system/gpu-setup.service
+  content: |
+    [Unit]
+    Description=NVIDIA GPU Runtime Setup
+    Before=rke2-agent.service
+    # Idempotency is handled inside setup-gpu.sh so this unit can still satisfy
+    # Requires= on later boots (ConditionPathExists skips break Requires).
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/usr/local/bin/setup-gpu.sh
+
+    [Install]
+    WantedBy=multi-user.target
+
+- path: /etc/systemd/system/rke2-agent.service.d/gpu-setup.conf
+  content: |
+    [Unit]
+    After=gpu-setup.service
+    Requires=gpu-setup.service
+
+%{ endif }
 
 runcmd:
   - mkdir -p /mnt /var/lib/rancher/rke2 /var/lib/kubelet
@@ -346,7 +474,29 @@ runcmd:
   - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "rke2-server active after restart" "systemctl is-active -q rke2-server.service" 3 60'
   %{~ endif ~}
   %{~ else ~}
-  - systemctl enable rke2-agent.service
-  - systemctl start rke2-agent.service
-  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "rke2-agent active" "systemctl is-active -q rke2-agent.service" 3 60'
+  - |
+%{ if gpu.enabled }
+    systemctl daemon-reload
+    systemctl enable gpu-setup.service
+%{ if !gpu.driver.preinstalled }
+    if ! modprobe -q nvidia; then
+      if [ -f /var/lib/gpu-reboot-attempted ]; then
+        echo "FATAL: nvidia module still not loadable after reboot"
+        exit 1
+      fi
+      # After reboot, enabled units (gpu-setup + rke2-agent) start via systemd;
+      # cloud-init will not re-run the remaining runcmd.
+      touch /var/lib/gpu-reboot-attempted
+      systemctl enable rke2-agent.service
+      echo "NVIDIA driver not loaded yet - rebooting; gpu-setup.service and rke2-agent.service start on next boot"
+      reboot
+      sleep 300
+      exit 0
+    fi
+%{ endif }
+    systemctl start gpu-setup.service
+%{ endif }
+    systemctl enable rke2-agent.service
+    systemctl start rke2-agent.service
+  - bash -c 'source /usr/local/bin/cloud-init-wait.sh && wait_for "rke2-agent active" "systemctl is-active -q rke2-agent.service" 5 120'
   %{~ endif ~}
